@@ -1,0 +1,1081 @@
+module Sincyclepippro (
+  input logic clk,
+  input logic reset,
+  input logic time_interrupt,
+  input logic ext_interrupt);
+  
+//Fetch stage variables
+  logic [31:0] progcount;
+  logic [31:0] progcount_addr;
+  logic [31:0] progcount_muxout;
+  
+  //Instruction variables
+  logic [31:0] inst_addr;
+  logic [31:0] inst_memory [31:0];
+  logic [31:0] instr;
+  
+//Decode stage variables
+  logic [6:0] opcode;
+  logic [2:0] aluop;
+  logic [4:0] rs1, rs2, rd;
+  logic [31:0] imm;
+  
+  //Parameter selection
+  parameter I = 1; //Load
+  parameter S = 2; //Store
+  parameter B = 3; //Branch
+  parameter U = 4; //Upper immediate
+  parameter J = 5; //Jump
+
+  
+  //Branch variables
+  logic br_taken;
+  logic br_unsigned;
+  logic br_eq;
+  logic br_lessthan;
+  
+  //Register file variables
+  logic [31:0] reg_file [31:0];
+  logic [31:0] rdata1, rdata2;
+  logic [31:0] reg_wdata;
+  
+//Execute stage variables
+  logic [31:0] srcA, srcB;
+  logic [31:0] alu;
+  
+//Data Memory Stage variables
+  logic [31:0] mem_addr;
+  logic [31:0] rdata;
+  logic [31:0] mem_wdata;
+  logic [7:0] data_memory [1023:0];
+  
+//Writeback Stage variables
+  logic [31:0] wb_muxout;
+  logic [31:0] branch_target_addr;
+  logic [31:0] jump_target_addr;
+  
+//Pipeline Stage variables
+  logic [31:0] progcount_fe, progcount_ex, progcount_ex_addr;
+  logic [31:0] fe_ex_instr, ex_rd_instr;
+  logic [31:0] ex_mem_wdata, ex_mem_alu;
+  logic [31:0] ex_mem_data, ex_mem_addr;
+  
+  //Data hazard variables (forwarding)
+  logic [31:0] rdata1_fd, rdata2_fd;
+  logic dhz_selA, dhz_selB;
+  logic stall_stage;
+  
+  //Control hazard variables
+  logic flush;
+  
+//CSR read write variables
+  logic [31:0] progcount_muxout_csr;
+  logic [31:0] progcount_csr;
+  logic [31:0] csr_wdata;
+  logic [31:0] csr_mem;
+  logic [31:0] csr_addr;
+  logic [31:0] csr_rdata;
+  logic [31:0] csr_epc_evec;
+  logic [31:0] csr_file [4095:0]; // csr 2^12 bits
+  logic [11:0] csr_reg_address;
+  
+  //CSR register variables
+  logic [31:0] mie;
+  logic [31:0] mip;
+  logic [31:0] mstatus;
+  logic [31:0] mcause;
+  logic [31:0] mtvec;
+  logic [31:0] mepc;
+  logic [31:0] mcause_sll2;
+  logic [31:0] instr_csr;
+  logic or_all_interrupt;
+  logic exception_interrupt;
+  logic [2:0] csr_opsel;
+  
+  //CSR wires for interrupt:
+  logic mip_meip_bit;
+  logic mip_mtip_bit;
+  logic mie_mtie_bit;
+  logic mie_meie_bit;
+  logic mstatus_mie_bit;
+  
+  //CSR for address calculation
+  logic [31:0] interrupt_encode;
+  logic [31:0] epc_evec_mux1_out;
+  logic [31:0] epc_evec_mux2_out;
+  logic [2:0] epc_evec_mux1_sel;
+  logic epc_evec_mux2_sel;
+  
+//UART Module variables 
+  logic [7:0] data_in;
+  logic load_shift_reg;
+  logic shift_en;
+  logic mux_sel_uart;
+  logic clear_baud_counter;
+  logic clear_bit_counter;
+  logic [2:0] baud_counter;
+  logic [3:0] bit_counter;
+  logic tx_data;
+  logic [4:0] test;
+  logic [9:0] shift_reg;
+  
+  logic valid_in;
+  logic [31:0] uart_rdata;
+  logic tx_start;
+  logic [31:0] status_reg;
+  logic [1:0] Present_state;
+  logic [1:0] Next_state;
+  
+  logic sel_bit;
+  logic [31:0] uart_addr;
+  logic [31:0] uart_wdata;
+  
+  parameter Ideal = 0;
+  parameter Load_state =1;
+  parameter transmission = 2;
+  
+  //Bus address variables
+  logic [31:0] uart_rdata_1, uart_rdata_2, uart_rdata_3;
+  logic sel_1, sel_2, sel_3;
+  logic rdata_bus2mem;
+  logic [31:0] uart_addr_out;
+  logic [3:0] data_bus_addr; //for decoding
+  logic [3:0] ls_addr; //slave address
+  logic [31:0] addr_lsu2bus;
+
+/*------------------------------------*/  
+  
+//Controller
+  logic reg_wr;
+  logic aluselA;
+  logic aluselB;
+  logic alusel;
+  logic [2:0] imm_sel;
+  logic memory_rw_en;
+  logic [2:0] wb_sel;
+  logic csr_memory_rw_en;
+  logic csr_memory_rw_enMW;
+  logic is_mret;
+  logic epc_taken;
+ 
+  //Pipeline controller
+  logic reg_wrMW;
+  logic memory_rw_enMW;
+  logic [2:0] wb_selMW;
+  logic stall_stageMW;
+
+  
+  //------------DATA PATH--------------
+  
+//1. ----Fetch Stage----
+  
+  //Progcounter
+  always @(posedge clk) begin
+    if (reset) begin
+      progcount <= 0;
+    end else begin
+      progcount <= progcount_muxout_csr;
+    end
+  end
+  
+  //Progcount_addr
+  always @(*) begin
+    progcount_addr = progcount + 4;
+    progcount_ex_addr = progcount_ex + 4;
+    progcount_muxout = br_taken ? alu : progcount_addr;
+    progcount_muxout_csr = epc_taken ? csr_epc_evec : progcount_muxout;
+  end
+  
+  //Instruction memory
+      assign inst_addr = progcount[31:2];
+      assign instr = inst_memory[inst_addr];
+  
+  //Read values from inst memory
+  initial begin
+    $readmemh("inst_memory.txt",inst_memory);
+  end
+  
+  //Fetch Pipeline stage
+  always @(posedge clk) begin
+        if (!reset) begin
+        if (flush) begin
+            //progcount_fe <= 32'b0;
+            fe_ex_instr <= 32'b0;
+        end else begin
+            if (opcode == 7'b1100011) begin // B type
+                progcount_muxout_csr <= branch_target_addr;
+                progcount_fe <= progcount_muxout_csr;
+                fe_ex_instr <= instr;
+            end else if (opcode == 7'b1101111 || opcode == 7'b1100111) begin // J type
+                progcount_muxout_csr <= jump_target_addr;
+                progcount_fe <= progcount_muxout_csr;
+                fe_ex_instr <= instr;
+            end else begin
+                progcount_fe <= progcount;
+                fe_ex_instr <= instr;
+            end
+        end
+    end else begin
+        progcount_muxout_csr <= 32'b0;
+        progcount_fe <= 32'b0;
+        fe_ex_instr <= 32'b0;
+    end
+  end
+  
+  
+//2. ----Decode Stage----
+  
+  //Reg file initialization
+  always @(posedge clk) begin
+    for(int i=0;i<32;i++)
+      reg_file[i] <= i;
+  end
+  
+  //Assign values to registers
+  always @(*) begin
+    rs1 = fe_ex_instr[19:15];
+    rs2 = fe_ex_instr[24:20];
+    opcode = fe_ex_instr[6:0];
+    aluop = fe_ex_instr[14:12];
+    rdata1 = reg_file[rs1];
+    rdata2 = reg_file[rs2];
+  end
+  
+  //Immediate Generation
+  always @(*) begin
+  imm[0] = (imm_sel == B | imm_sel == U | imm_sel == J) ? 0 : imm_sel == I ? instr[20] : instr[7]; //not B,U,J,I then it is S type 
+  imm[4:1] = imm_sel == J ? instr[24:21] : (imm_sel == B | imm_sel == S) ? instr[11:8] : imm_sel == I ? instr[24:21] : 0; //not B,J,I,S then U type
+  imm[10:5] = imm_sel == U ? 0 : instr [30:25]; //not U then any type
+  imm[11] = imm_sel == B ? instr[7] : imm_sel == J ? instr[20] : imm_sel == U ? 0 : instr[31]; //if not B,J,U then I,S type
+  for(int i=12;i<20;i++)
+      imm[i] = (imm_sel == U | imm_sel == J) ? instr[i] : instr[31];
+    for(int i=20;i<32;i++)
+      imm[i] = imm_sel == U ? instr[i] : instr[31];
+  end
+
+  
+//3. ----Execute Stage----
+  
+  //Assign values to forward variables
+  always @(*) begin
+    rdata1_fd = dhz_selA ? ex_mem_alu : rdata1;
+    rdata2_fd = dhz_selB ? ex_mem_alu : rdata2;
+  end
+  
+  //Assign values to sources
+  always @(*) begin
+    srcA = aluselA ? progcount_fe : rdata1_fd;
+    srcB = aluselB ? imm : rdata2_fd;
+  end
+  
+  //Branch comparison
+  always @(*) begin
+    if(br_unsigned == 1) begin //For Unsigned
+      if(rdata1 == rdata2)
+        br_eq = 1;
+      else
+        br_eq = 0;
+      if(rdata1 < rdata2)
+      br_lessthan = 1;
+      else
+       br_lessthan = 0;
+    end
+    else begin //For Signed
+      if(rdata1 == rdata2)
+        br_eq = 1;
+      else
+        br_eq = 0;
+      if(rdata1 < rdata2)
+      br_lessthan = 1;
+      else
+      br_lessthan = 0;
+    end
+  end
+ 
+  //Arithmetic Logic
+  always @(*) begin
+    case(aluop)
+      3'b000: begin //Sub & Add, addi
+        if(alusel == 1 && wb_selMW ==0 && br_taken == 0 )
+          alu = srcA - srcB; 
+        else if(wb_selMW == 0 | wb_selMW == 1 && br_taken == 0)
+          alu = srcA + srcB;
+        else
+           begin
+             if(br_eq) //BEQ
+             alu = srcA + srcB;
+           else
+             alu = srcA + 4;
+         end
+      end
+
+      3'b001: begin //Sll, Slli
+        if(wb_selMW == 0 && br_taken == 0)
+        alu = srcA << srcB[4:0];
+        else
+           begin
+             if(!br_eq) //BNE
+             alu = srcA + srcB;
+         else
+           alu = srcA + 4;
+         end
+      end
+      
+      3'b010: begin //slt, slti
+        if(wb_selMW == 0)
+        if (srcA < srcB)
+          alu = 1;
+        else
+          alu = 0;
+        end
+      
+      3'b011: begin //sltu, sltiu
+        if(wb_selMW == 0)
+        if (srcA < srcB)
+          alu = 1;
+        else
+          alu = 0;
+        end
+      
+      3'b100: begin //xor, xori
+        if(wb_selMW == 0 | wb_selMW == 1 && br_taken == 0)
+        alu = srcA ^ srcB;
+        else
+           begin
+             if(br_lessthan) //br_lt
+             alu = srcA + srcB;
+           else
+             alu = srcA + 4;
+           end
+        end
+      
+      3'b101: begin //srl, srli
+        if(wb_selMW == 0 && br_taken == 0) begin
+          if(instr[30] == 1)
+          alu = srcA >>> srcB[4:0];
+        else 
+          alu = srcA >> srcB[4:0];
+        end
+        else
+           begin
+             if(!br_lessthan) //br_ge
+             alu = srcA + srcB;
+           else
+             alu = srcA + 4;
+         end
+       end
+      
+      3'b110: begin //or, ori
+         if (br_taken == 0)
+        alu = srcA | srcB;
+        else begin 
+          if(br_unsigned && br_lessthan) //br_ltU
+            alu = srcA + srcB;
+          else
+            alu = srcA + 4;
+          end
+        end
+      
+      3'b111: begin //and, andi
+         if (br_taken == 0)
+        alu = srcA & srcB;
+        else begin 
+          if(br_unsigned && !br_lessthan) //!br_ltU
+            alu = srcA + srcB;
+          else
+            alu = srcA + 4;
+          end
+      end
+    endcase
+  end
+  
+  //ALU for other types
+  always @(*) begin
+    if(alusel == 1 | alusel == 0) begin
+          if (opcode == 7'b0110111) //LUI
+            alu = srcB;
+       else if (opcode == 7'b000011  //Load
+              | opcode == 7'b0100011 //Store
+              | opcode == 7'b1100111 //JALR
+              | opcode == 7'b1101111  // JAL
+              | opcode == 7'b0110111) //AUIPC
+         alu = srcA + srcB;
+       else
+         alu = srcA + 4;
+       end
+  end
+  
+  //Execute Pipeline stage
+  always @(posedge clk) begin
+    if (!reset) begin
+      if(stall_stageMW) begin
+        progcount_ex <= progcount_ex;
+        ex_mem_alu <= ex_mem_alu;
+        ex_mem_wdata <= ex_mem_wdata;
+        ex_rd_instr <= ex_rd_instr;
+      end
+      else begin
+        progcount_ex <= progcount_fe;
+        ex_mem_alu <= alu;
+        ex_mem_wdata <= rdata2;
+        ex_rd_instr <= fe_ex_instr;
+        end
+      end else begin
+        progcount_ex <= 32'b0;
+        ex_mem_alu <= 32'b0;
+        ex_mem_wdata <= 32'b0;
+        ex_rd_instr <= 32'b0;
+    end
+  end
+    
+  
+//4.  ----Data Memory stage----
+  
+  //data memory initialize
+  always @(posedge clk) begin
+    for(int i=0;i<32;i++)
+      data_memory[i] <= i;
+  end
+  
+  //assign values to memory
+  assign mem_addr = ex_mem_alu;
+  
+  //Read operation for Load type
+  always @(*) begin
+    case(aluop)
+      3'b000: begin //Load byte
+        rdata[7:0] = data_memory[mem_addr];
+        for(int i = 0; i < 7 ; i++)
+          rdata[i] = rdata[7];
+      end
+      
+      3'b001: begin //Load Halfword
+          rdata[15:0] = {data_memory[mem_addr+1],
+                         data_memory[mem_addr]}; 
+          for(int i = 16; i < 32; i++)
+            rdata[i] = rdata[15]; 
+      end
+      
+      3'b010: begin //Load Word
+          rdata = {data_memory[mem_addr+3],data_memory[mem_addr+2],
+                   data_memory[mem_addr+1],data_memory[mem_addr]}; 
+      end
+      
+      3'b100: begin //Load Byte Unsigned
+          rdata[7:0] = data_memory[mem_addr];
+          for(int i = 8; i < 32; i++)
+            rdata[i] = 0; 
+        end
+      
+        3'b101: begin //Load Halfword Unsigned
+          rdata[15:0] = {data_memory[mem_addr+1],
+                         data_memory[mem_addr]};
+          for(int i = 16; i < 32; i++)
+            rdata[i] = 0;
+        end
+          endcase
+    end
+  
+  //Write operation for S Type
+  always @(posedge clk) begin
+    if(memory_rw_enMW == 1 && (ls_addr!= 4'h8 | ls_addr!= 4'h4 | ls_addr!= 4'h2)) begin
+      case (aluop)
+        3'b000: begin
+          data_memory[mem_addr] = mem_wdata[7:0];
+        end
+        3'b001: begin
+          data_memory[mem_addr+1] = mem_wdata[15:8];
+          data_memory[mem_addr] = mem_wdata[7:0];
+        end
+        3'b010: begin
+          data_memory[mem_addr+3] = mem_wdata[31:24];
+          data_memory[mem_addr+2] = mem_wdata[23:16];
+          data_memory[mem_addr+1] = mem_wdata[15:8];
+          data_memory[mem_addr] = mem_wdata[7:0];
+        end
+      endcase
+    end
+  end
+
+  //Store logic control
+  always @(*) begin
+    if(memory_rw_enMW)
+      mem_wdata <= ex_mem_wdata;
+    else
+      mem_wdata <= 0;
+  end
+  
+// ----------CSR Interrupts----------
+  
+  //CSR assign registers
+  assign mstatus = csr_file[12'h300];
+  assign mie = csr_file[12'h304];
+  assign mtvec = csr_file[12'h305];
+  assign mepc = csr_file[12'h341];
+  assign mcause = csr_file[12'h342];
+  assign mip = csr_file[12'h344];
+  assign csr_opsel = instr_csr[14:12];
+  assign csr_reg_address = instr_csr[31:20];
+  assign csr_mem = wb_selMW ? csr_rdata : wb_muxout;
+  
+  //CSR assign mux values
+  assign epc_evec_mux1_sel = mtvec[1:0];
+  assign epc_evec_mux2_sel = is_mret;
+  
+  //CSR assign register bits
+  assign mip_mtip_bit = mip [7];
+  assign mip_meip_bit = mip [11];
+  assign mie_mtie_bit = mie [7];
+  assign mie_meie_bit = mie [11];
+  assign mstatus_mie_bit = mstatus [3];
+  
+  
+  //CSR instruction
+  assign instr_csr = instr;
+
+  //CSR RW Logic control
+  always @(*) begin
+   // if(csr_memory_rw_enMW)
+     csr_wdata = ex_mem_data;
+    //else
+     // csr_wdata = 0;
+  end
+  
+  //assign CSR initialization
+  always @(posedge clk) begin
+    for(int i=0; i< 4096; i++)
+      csr_file[i] <= i;
+  end
+  
+  //assign CSR registers
+  always @(*) begin
+    progcount_csr = progcount_ex;
+    csr_addr = ex_mem_addr;
+  end
+  
+//Exception/Interrupt handling
+  and (time_interrupt, mip_mtip_bit,mie_mtie_bit);
+  and(ext_interrupt, mip_meip_bit,mie_meie_bit);
+  or (or_all_interrupt, time_interrupt, ext_interrupt);
+  and(exception_interrupt, or_all_interrupt,  mstatus_mie_bit);
+  
+//CSR Address calculation
+  
+  //assign interrupts
+  always @(*) begin
+    csr_file[12'h342] = interrupt_encode;//as it's for mcause
+    csr_file[12'h344][7] = time_interrupt; //as it's for mtip
+    csr_file[12'h344][11] = ext_interrupt; //as it's for meip
+  end
+  
+  //interrupt encoding
+  always @(*) begin
+    if (time_interrupt) // for time_interrupt mcause = 1
+      interrupt_encode = 1;
+  end
+  always @(*) begin
+    if (ext_interrupt) // for ext_interrupt mcause = 2
+      interrupt_encode = 2;
+  end
+  
+  //3. Csrrw insturction
+  always @(*) begin
+    assign csr_rdata = csr_file [csr_reg_address]; //csr register value will be send to rd
+    if (instr_csr[6:0] == 7'b1110011) begin
+      case (csr_opsel)
+        3'b001: begin //CSRRW
+          csr_file[csr_reg_address] = csr_wdata;
+        end
+        3'b010: begin //CSRRS
+          csr_file[csr_reg_address] = csr_file[csr_reg_address] | csr_wdata; 
+        end
+        3'b011: begin //CSRRC
+          csr_file[csr_reg_address] = csr_file[csr_reg_address] & ~csr_wdata;
+        end
+      endcase
+  end
+  end
+  
+   //mepc assign
+  always @ (*) begin
+    if(exception_interrupt == 1'b1) 
+      csr_file[12'h341] = progcount_csr + 4;
+  end
+  
+  //epc_evec_muxout assign
+  always @ (*) begin
+      	mcause_sll2 = mcause << 2;
+    	epc_evec_mux1_out = epc_evec_mux1_sel? mtvec : mcause_sll2 + mtvec;
+    	epc_evec_mux2_out = epc_evec_mux2_sel ? mepc : epc_evec_mux1_out; 
+  end
+  
+  //epc_evec result
+  assign csr_epc_evec = epc_evec_mux2_out;
+  
+
+//-------------UART MODULE---------------
+  
+  //transmission bin
+  always @(*) begin
+    uart_rdata = status_reg;
+    tx_data = mux_sel_uart ? 1'b1 : shift_reg [0];
+    ls_addr = addr_lsu2bus [31:28];
+  end
+  
+  //Sequential logic
+  always @(posedge clk) begin
+    if (reset) begin
+      baud_counter = 0;
+      bit_counter = 0;   
+   	  shift_reg = 0;
+  	  test = 0;
+  	end
+  
+  //baud_counter
+    if(clear_baud_counter)
+      	baud_counter = 0;
+    else 
+    	baud_counter = baud_counter + 1;
+    
+  //bit counter 
+    if (clear_bit_counter)
+      	bit_counter = 0;
+    if (baud_counter == 4 ) 
+      	bit_counter = bit_counter + 1;
+  end
+  
+  
+  //Combinational logic
+  always @(negedge clk) begin
+    if(load_shift_reg==1'b1)
+      begin 
+      shift_reg [8:1] <= data_in;
+      shift_reg [9] <= 1;
+      shift_reg [0] <= 0;
+      test = test +1;
+    end
+  end
+  
+  //Shift register
+  always @ (posedge clk) begin
+    if(shift_en) begin
+      shift_reg [0] <= shift_reg [1];
+      shift_reg [1] <= shift_reg [2];
+      shift_reg [2] <= shift_reg [3];
+      shift_reg [3] <= shift_reg [4];
+      shift_reg [4] <= shift_reg [5];
+      shift_reg [5] <= shift_reg [6];
+      shift_reg [6] <= shift_reg [7];
+      shift_reg [7] <= shift_reg [8];
+      shift_reg [8] <= shift_reg [9];
+      shift_reg [9] <= 1;
+    end
+  end
+  
+  //Data transmission uart
+  always @ (*) begin
+    if(sel_bit == 1'b1) begin
+  		data_in = uart_wdata[7:0];
+  		valid_in = uart_wdata[8];
+    end
+    else
+      valid_in = 0;
+  end
+  
+  //------UART Bus module-------
+ //data and address to peripheral
+  assign addr_out = uart_addr;
+  assign data_bus_addr = uart_addr[31:28];
+  
+  //Decoder operation
+  always @ (*) begin
+    case(data_bus_addr)
+      4'h8 : sel_1 = 1;
+      4'h4 : sel_2 = 1;
+      4'h2 : sel_3 = 1;
+      default begin
+        sel_1 = 0;
+        sel_2 = 0;
+        sel_3 = 0;
+      end
+    endcase
+  end
+  
+  //mux working as a orbitrator
+  always @ (*) begin
+    case (data_bus_addr)
+      4'h8 : rdata_bus2mem  = uart_rdata_1;
+      4'h4 : rdata_bus2mem = uart_rdata_2;
+      4'h2 : rdata_bus2mem = uart_rdata_3;
+      default 
+      rdata_bus2mem = 0;
+    endcase
+  end
+  
+  //UART rdata to writeback
+  always @ (posedge clk) begin
+    if((ls_addr == 4'h8 | ls_addr == 4'h4 | ls_addr == 4'h2)
+       &&(ex_rd_instr[6:0] == 7'b0000011 /*Load*/)) begin
+      wb_muxout = rdata_bus2mem;
+      test = 1;
+    end
+    else begin
+      wb_muxout = csr_mem;
+      test = 0;
+    end   
+  end
+  
+//5.  ----Writeback stage----
+  
+  //Wb_muxout result
+  always @(*) begin
+    if(reg_wrMW) begin
+      case(wb_selMW)
+      2'b00:
+        wb_muxout = ex_mem_alu;
+      2'b01:
+        wb_muxout = rdata;
+      2'b10:
+        wb_muxout = progcount_ex_addr;
+      2'b11:
+        wb_muxout = csr_rdata;
+      default:
+        wb_muxout = 0;
+    endcase
+  end
+  end
+  
+  //Wb_muxout to rd
+  always @(*) begin
+    reg_wdata = wb_muxout;
+    reg_file[rd] = reg_wdata;
+  end
+  
+  //Execute to rd stage
+  always @(posedge clk) begin
+    rd <= ex_rd_instr[11:7];
+  end
+    
+  
+    //----------CONTROLLER----------
+  
+  
+  //----br_taken Control----
+  always@(*) begin
+    if(((opcode == 7'b1100111 /*JALR*/) | (opcode == 7'b1101111 /*JAL*/))
+        | ((opcode == 7'b1100011 /*B type*/ ) && (br_eq) | (!br_eq)
+        | (br_lessthan) | (!br_lessthan)
+        | (br_unsigned && br_lessthan) | (br_unsigned && !br_lessthan)))
+      br_taken = 1;
+    else
+      br_taken = 0;
+  end
+ 
+  //----branch type Control----
+    always @ (*) begin
+      if(opcode == 7'b1100011 /*B type*/ && (aluop ==3'b110 /*Br_lessthanU*/ | aluop ==3'b111/*br_great_eqU*/ ))
+       br_unsigned = 1;
+     else 
+       br_unsigned = 0;
+    end
+  
+  //Jump and branch logic control
+   always @(posedge clk) begin
+    if (!reset) begin
+        jump_target_addr <= progcount + imm;
+        branch_target_addr <= progcount + imm;
+    end
+end
+  
+  //----reg_wr Control----
+  always @(*) begin
+    if(opcode == 7'b0110011 //R type
+    | opcode == 7'b0010011 //I type
+    | opcode == 7'b0000011  //I load type
+    | opcode == 7'b1100111  //JAL
+    | opcode == 7'b1100111) //JALR
+      reg_wr = 1;
+    else if (opcode == 7'b0100011 | opcode == 7'b1100011) //S type and B type
+      reg_wr = 0;
+  end
+  
+  //----imm_sel Control----
+  always @(*) begin
+    case(opcode)
+      7'b0010011, 7'b000011, 7'b1100111: /*I-type, I load type, JALR*/
+        imm_sel = I;
+      7'b0100011: /*S type*/
+        imm_sel = S;
+      7'b1100011: /*B type*/
+        imm_sel = B;
+      7'b1101111://JAL type
+      imm_sel = J;
+      7'b0110111 , 7'b0010111: //U type
+      imm_sel = U;
+      default: begin
+        imm_sel = 0;
+      end
+    endcase
+  end
+  
+  //-----Datahazard_sel-----
+  always @(*) begin
+    if (rd == rs1) begin
+      dhz_selA = 1;
+    end
+    else if (rd == rs2) begin
+      dhz_selB = 1;
+    end
+    else begin
+      dhz_selA = 0;
+      dhz_selB = 0;
+    end
+  end
+  
+  //----Stall logic Control----
+   always @(posedge clk) begin
+    if (!reset) begin
+        if (br_taken) begin
+            stall_stage <= 1'b1;
+        end else begin
+            stall_stage <= 1'b0;
+        end
+    end else begin
+        stall_stage <= 1'b0;
+    end
+   end
+  
+  //----Stall logic pipeline Control----
+  always @(posedge clk) begin
+    stall_stageMW <= stall_stage;
+  end
+
+  //----Flush logic Control----
+  always @(posedge clk) begin
+    if (!reset) begin
+      if (stall_stage) begin
+            flush <= 1'b1;
+        end else begin
+            flush <= 1'b0;
+        end
+    end else begin
+        flush <= 1'b0;
+    end
+  end
+  
+  //----------CSR pipeline------------
+  always @(posedge clk) begin
+    ex_mem_data <= rdata1_fd;
+    ex_mem_addr <= imm;
+    csr_memory_rw_enMW <= csr_memory_rw_en;
+  end
+  
+    //----is_mret control------
+  always @(*) begin
+    if (instr_csr == 32'h30200073)
+        is_mret = 1;
+    else
+        is_mret = 0;
+  end
+  
+  //----epc taken control----
+    always @(*) begin
+      if(!reset) begin
+        if(is_mret == 1'b1) //mret type
+          epc_taken = 1;
+        else if(exception_interrupt == 1'b1)
+        epc_taken = 1;
+        else if(exception_interrupt == 1'b0 && is_mret == 1'b0)
+        epc_taken = 0;
+        end
+      else begin
+        epc_taken = 0;
+      end
+    end
+  
+  //----csr_memory_rw_en Control----
+  always @(*) begin
+    if(opcode == 7'b1110011) //For CSR
+      csr_memory_rw_en = 1;
+      else
+      csr_memory_rw_en = 0;
+  end
+  
+  //----aluselA Control----
+  always @(*) begin
+    if(opcode == 7'b1100011 //B type
+      | opcode == 7'b1101111 //JAL
+      | opcode == 7'b0010111) //AUIPC
+        aluselA = 1;
+    else
+        aluselA = 0;
+  end
+  
+  //----aluselB Control----
+  always @(*) begin
+    if(opcode == 7'b0010011 //I type
+      | opcode == 7'b0000011 //I load
+      | opcode == 7'b0100011 //S type
+      | opcode == 7'b1100011 //B type
+      | opcode == 7'b1101111 // JAL
+      | opcode == 7'b1100111 //JALR
+      | opcode == 7'b0110111 //LUI
+      | opcode == 7'b0010111) //AUIPC
+        aluselB = 1;
+    else
+        aluselB = 0;
+  end
+
+  
+  //----alusel Control----
+  always @(*) begin
+    if(opcode == 7'b0110011) /*R type*/
+      if(instr[30] == 1)
+        alusel = 1;
+    else
+      alusel = 0;
+    else if (opcode == 7'b0010011) /*I type*/
+      if(aluop == 3'b101 && instr[30]==1)
+      alusel = 1;
+    else
+      alusel = 0;
+    else if( opcode == 7'b1100011 | 7'b0110111 ) //B, U type
+      alusel = B; //B, LUI
+    else
+      alusel = J; //add//AUIPC
+  end
+  
+  //----memory_rw_en Control----
+  always @(*) begin
+    if(opcode == 7'b0100011 | opcode == 7'b1100011) //For S and B type
+      memory_rw_en = 1;
+      else
+      memory_rw_en = 0; //For R, I, Load, U, J type
+  end
+  
+  
+  //----wb_sel Control-----
+  always @(*) begin
+    case(opcode)
+      7'b0000011: /*Load type*/
+        wb_sel = 1;
+      7'b1101111, 7'b1100111: /*JAL, JALR type*/
+      wb_sel = 2;
+      7'b1110011: /*CSR type*/
+        wb_sel = 3;
+      default: /*R, I, S, B type*/
+        wb_sel = 0;
+    endcase
+  end 
+  
+  //----Pipeline Control----
+  always @(posedge clk) begin
+    reg_wrMW <= reg_wr;
+    memory_rw_enMW <= memory_rw_en;
+    wb_selMW <= wb_sel;
+  end
+  
+  //----Present State UART control-----
+  always @ (*) begin
+    if (Present_state == Ideal)
+      status_reg = 32'h00000000;
+    else
+      status_reg = 32'h00000001;
+  end
+  
+  //------Load shift reg Control-----
+  always @ (negedge clk) begin
+    if(valid_in == 1'b1)
+       load_shift_reg = 0;
+  end
+  
+  //----Sequential logic Control-----
+  always @ (posedge clk) begin
+    if (reset) begin
+      Present_state <=  0;
+      mux_sel_uart <=  1;
+    end
+    else begin
+      Present_state <=  Next_state;
+    end
+  end
+  
+  //----Tx start counter Control----
+  always @ (*) begin
+    if(tx_start == 1'b1) begin
+      clear_baud_counter =  1;
+      clear_bit_counter =  1;
+    end
+  end
+  
+  //------UART Load & Transmission Control------
+  always @ (*) begin
+    case (Present_state)
+      Ideal: if (valid_in) begin
+        		load_shift_reg = 1 ;
+			    shift_en = 0;
+  				clear_baud_counter = 0;
+  				clear_bit_counter = 0 ;
+        		mux_sel_uart = 1;
+        		tx_start =1;
+        		Next_state = Load_state;
+      		 end
+      		 else begin
+                load_shift_reg = 0 ;
+			    shift_en = 0;
+  				clear_baud_counter = 0;
+  				clear_bit_counter = 0 ;
+                mux_sel_uart = 1;
+        		Next_state = Ideal;
+             end
+      
+      Load_state: if(tx_start) begin
+                    load_shift_reg = 0 ;
+                    shift_en = 0;
+  			        clear_baud_counter = 0;
+  					clear_bit_counter = 0 ;
+        			mux_sel_uart = 0;
+        			Next_state = transmission;
+      		end
+      		else begin
+                     load_shift_reg = 0 ;
+				     shift_en = 0;
+  				     clear_baud_counter = 0;
+  					 clear_bit_counter = 0 ;
+                     mux_sel_uart = 1;
+        			 Next_state = Load_state;	
+            end
+      
+      transmission: if (!(baud_counter==4) &&  !(bit_counter == 10)) begin
+        					load_shift_reg = 0 ;
+						    shift_en = 0;
+  							clear_baud_counter = 0;
+  							clear_bit_counter = 0 ;
+                          	mux_sel_uart = 0;
+        					Next_state = transmission;
+        					tx_start = 0;
+      		end
+      else if ((baud_counter==4) &&  !(bit_counter == 10)) begin
+                    		load_shift_reg = 0 ;
+						    shift_en = 1;
+  							clear_baud_counter = 1;
+  							clear_bit_counter = 0 ;
+                          	mux_sel_uart = 0;
+                      		tx_start = 0;
+        					Next_state = transmission;        	  
+        	end
+      else if (baud_counter==4 &&  bit_counter == 10) begin
+                    		load_shift_reg = 0 ;
+						    shift_en = 0;
+  							clear_baud_counter = 1;
+  							clear_bit_counter = 1 ;
+                          	mux_sel_uart = 1;
+                      		tx_start = 0;
+        					Next_state = Ideal;        	  
+        	end
+      default: 
+							Next_state = 0;	        
+    endcase
+  end 
+   
+endmodule
