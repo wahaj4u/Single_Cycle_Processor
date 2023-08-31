@@ -1,0 +1,27 @@
+`timescale 1ns/1ns
+module Sincyclepippro_tb();
+  logic clk;
+  logic reset;
+  logic time_interrupt;
+  logic ext_interrupt;
+  
+  Sincyclepippro dut(.*);
+  
+always #5 clk = ~clk;
+  initial begin
+    $dumpfile ("dump.vcd");
+    $dumpvars;
+//initialize block
+  time_interrupt = 0;
+  ext_interrupt = 0;
+  clk = 0;
+  reset = 0;
+  @ (posedge clk) reset  =  1;
+  @ (posedge clk) reset  =  0; 
+    
+    @ (posedge clk) #5 time_interrupt = 1;
+    @ (posedge clk) #5 time_interrupt = 0;
+    #800;
+    $finish;
+end
+endmodule
